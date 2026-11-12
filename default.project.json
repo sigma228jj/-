@@ -2,6 +2,28 @@
   "name": "CrystalRift",
   "tree": {
     "$className": "DataModel",
+    "Workspace": {
+      "$className": "Workspace",
+      "Baseplate": {
+        "$className": "Part",
+        "$properties": {
+          "Anchored": true,
+          "Locked": true,
+          "Size": [512, 20, 512],
+          "Position": [0, -10, 0],
+          "Material": "Grass",
+          "Color": [0.35, 0.55, 0.3]
+        }
+      },
+      "SpawnLocation": {
+        "$className": "SpawnLocation",
+        "$properties": {
+          "Anchored": true,
+          "Size": [12, 1, 12],
+          "Position": [0, 0.5, 0]
+        }
+      }
+    },
     "ReplicatedStorage": {
       "$className": "ReplicatedStorage",
       "CrystalRiftConfig": {
@@ -12,6 +34,9 @@
       "$className": "ServerScriptService",
       "CrystalRift": {
         "$path": "src/ServerScriptService/CrystalRift.server.lua"
+      },
+      "TestDummies": {
+        "$path": "src/ServerScriptService/TestDummies.server.lua"
       }
     },
     "StarterPlayer": {
