@@ -1,5 +1,5 @@
 {
-  "name": "CrystalRift",
+  "name": "KatanaArena",
   "tree": {
     "$className": "DataModel",
     "Workspace": {
@@ -28,6 +28,9 @@
       "$className": "ReplicatedStorage",
       "CrystalRiftConfig": {
         "$path": "src/ReplicatedStorage/CrystalRiftConfig.lua"
+      },
+      "KatanaConfig": {
+        "$path": "src/ReplicatedStorage/KatanaConfig.lua"
       }
     },
     "ServerScriptService": {
@@ -35,8 +38,11 @@
       "CrystalRift": {
         "$path": "src/ServerScriptService/CrystalRift.server.lua"
       },
-      "TestDummies": {
-        "$path": "src/ServerScriptService/TestDummies.server.lua"
+      "Katana": {
+        "$path": "src/ServerScriptService/Katana.server.lua"
+      },
+      "Enemies": {
+        "$path": "src/ServerScriptService/Enemies.server.lua"
       }
     },
     "StarterPlayer": {
@@ -45,6 +51,9 @@
         "$className": "StarterPlayerScripts",
         "CrystalRiftClient": {
           "$path": "src/StarterPlayer/StarterPlayerScripts/CrystalRiftClient.client.lua"
+        },
+        "KatanaClient": {
+          "$path": "src/StarterPlayer/StarterPlayerScripts/KatanaClient.client.lua"
         }
       }
     }

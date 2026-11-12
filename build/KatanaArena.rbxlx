@@ -1,0 +1,2352 @@
+<roblox version="4">
+  <Item class="ReplicatedStorage" referent="0">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="ModuleScript" referent="1">
+      <Properties>
+        <string name="Name">CrystalRiftConfig</string>
+        <string name="Source"><![CDATA[-- Общие настройки способности «Кристальный разлом» (сервер + клиент).
+local Config = {
+	RemoteName = "CrystalRiftRemote",
+	EffectsFolderName = "CrystalRiftEffects",
+
+	-- Управление: зажать — прицел, отпустить — каст
+	Key = Enum.KeyCode.E,
+	GamepadKey = Enum.KeyCode.ButtonY,
+
+	Cooldown = 6,
+	MinRange = 12,
+	MaxRange = 70,
+
+	-- Волна шипов
+	StartOffset = 4, -- первый шип на таком расстоянии от игрока
+	SpikeSpacing = 3.5,
+	SpikeDelay = 0.045,
+	SpikeWidth = 2.2,
+	SpikeHeightMin = 4,
+	SpikeHeightMax = 10, -- шипы растут по мере удаления от игрока
+	SpikeLean = 0.35, -- наклон шипов по направлению волны
+	SpikeJitter = 0.25,
+	RiseTime = 0.22,
+	MaxStepHeight = 6, -- перепад выше — волна упирается в препятствие
+
+	-- Урон по пути
+	HitRadius = 5,
+	Damage = 20,
+	KnockUp = 45,
+	KnockBack = 18,
+	SlowMultiplier = 0.45,
+	SlowDuration = 1.6,
+	FriendlyFire = false,
+
+	-- Финальный взрыв
+	FinaleSpikes = 7,
+	FinaleRadius = 12,
+	FinaleDamage = 30,
+	FinaleCenterHeight = 16,
+
+	-- Разрушение
+	Lifetime = 2.2,
+	ShardsPerSpike = 5,
+	ShardLifetime = 1.6,
+
+	GroundProbeUp = 15,
+	GroundProbeDown = 40,
+
+	Color = Color3.fromRGB(110, 205, 255),
+	CoreColor = Color3.fromRGB(220, 250, 255),
+}
+
+return Config
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="ModuleScript" referent="2">
+      <Properties>
+        <string name="Name">KatanaConfig</string>
+        <string name="Source"><![CDATA[-- Общие настройки катаны (сервер + клиент).
+return {
+	RemoteName = "KatanaRemote",
+	EffectsFolderName = "KatanaEffects",
+	ToolName = "Катана",
+
+	Color = Color3.fromRGB(255, 60, 100), -- свечение лезвия и эффектов
+	CoreColor = Color3.fromRGB(255, 220, 230),
+
+	Keys = {
+		Wave = Enum.KeyCode.Q,
+		Dash = Enum.KeyCode.R,
+		Ultimate = Enum.KeyCode.F,
+	},
+
+	-- ЛКМ: комбо из трёх ударов, третий — добивающий с отбросом
+	Slash = {
+		Cooldown = 0.35,
+		ComboWindow = 0.9,
+		Damage = { 14, 16, 28 },
+		Range = 8,
+		Width = 9,
+		FinisherKnock = 45,
+	},
+
+	-- Q: летящая волна-полумесяц, пробивает всех на пути
+	Wave = {
+		Cooldown = 4,
+		Damage = 30,
+		Speed = 95,
+		Range = 120,
+		Width = 14,
+		Height = 6,
+	},
+
+	-- R: рывок сквозь врагов с порезами
+	Dash = {
+		Cooldown = 5,
+		Damage = 28,
+		Distance = 34,
+		Width = 7,
+	},
+
+	-- F: буря клинков — серия ударов вокруг + финальный взрыв
+	Ultimate = {
+		Cooldown = 18,
+		Hits = 8,
+		Interval = 0.12,
+		Damage = 10,
+		Radius = 16,
+		FinalDamage = 40,
+	},
+}
+]]></string>
+      </Properties>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="3">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Script" referent="4">
+      <Properties>
+        <string name="Name">CrystalRift</string>
+        <token name="RunContext">0</token>
+        <string name="Source"><![CDATA[-- Серверная часть «Кристального разлома»: проверка каста, генерация шипов, урон, разрушение.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+local Config = require(ReplicatedStorage:WaitForChild("CrystalRiftConfig"))
+
+local remote = Instance.new("RemoteEvent")
+remote.Name = Config.RemoteName
+remote.Parent = ReplicatedStorage
+
+local effects = Instance.new("Folder")
+effects.Name = Config.EffectsFolderName
+effects.Parent = workspace
+
+local rng = Random.new()
+local lastCast = {}
+
+Players.PlayerRemoving:Connect(function(player)
+	lastCast[player] = nil
+end)
+
+local function lerp(a, b, t)
+	return a + (b - a) * t
+end
+
+local function getAlive(model)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if humanoid and root and humanoid.Health > 0 then
+		return humanoid, root
+	end
+	return nil, nil
+end
+
+local function makePart(props)
+	local part = Instance.new("Part")
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	for key, value in pairs(props) do
+		part[key] = value
+	end
+	return part
+end
+
+-- Луч вниз; персонажей (и NPC) пропускаем, чтобы шип не вырос у кого-то на голове.
+local function findGround(position)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { effects }
+	params.IgnoreWater = false
+
+	local origin = position + Vector3.new(0, Config.GroundProbeUp, 0)
+	local direction = Vector3.new(0, -(Config.GroundProbeUp + Config.GroundProbeDown), 0)
+	for _ = 1, 5 do
+		local result = workspace:Raycast(origin, direction, params)
+		if not result then
+			return nil
+		end
+		local model = result.Instance:FindFirstAncestorOfClass("Model")
+		if model and model:FindFirstChildOfClass("Humanoid") then
+			params:AddToFilter(model)
+		else
+			return result.Position, result.Normal, result.Instance
+		end
+	end
+	return nil
+end
+
+-- Есть ли стена между двумя точками земли.
+local function isBlocked(fromPos, toPos)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { effects }
+	local lift = Vector3.new(0, 2, 0)
+	local offset = (toPos + lift) - (fromPos + lift)
+	local result = workspace:Raycast(fromPos + lift, offset, params)
+	if not result then
+		return false
+	end
+	local model = result.Instance:FindFirstAncestorOfClass("Model")
+	return not (model and model:FindFirstChildOfClass("Humanoid"))
+end
+
+local function alignToUp(position, up)
+	local axis = Vector3.yAxis:Cross(up)
+	if axis.Magnitude < 1e-4 then
+		return CFrame.new(position)
+	end
+	local angle = math.acos(math.clamp(Vector3.yAxis:Dot(up), -1, 1))
+	return CFrame.new(position) * CFrame.fromAxisAngle(axis.Unit, angle)
+end
+
+local function spawnRubble(position, groundPart, width)
+	local material, color = Enum.Material.Rock, Color3.fromRGB(105, 100, 95)
+	if groundPart and groundPart:IsA("BasePart") and not groundPart:IsA("Terrain") then
+		material, color = groundPart.Material, groundPart.Color
+	end
+	for i = 1, 3 do
+		local angle = (i / 3) * math.pi * 2 + rng:NextNumber(-0.5, 0.5)
+		local radius = width * rng:NextNumber(0.7, 1.1)
+		local s = rng:NextNumber(0.8, 1.5)
+		local rock = makePart({
+			Name = "Rubble",
+			Size = Vector3.new(s, s, s),
+			Material = material,
+			Color = color,
+			CFrame = CFrame.new(position + Vector3.new(math.cos(angle) * radius, s * 0.2, math.sin(angle) * radius))
+				* CFrame.Angles(rng:NextNumber(0, 6.28), rng:NextNumber(0, 6.28), rng:NextNumber(0, 6.28)),
+		})
+		rock.Parent = effects
+		task.delay(Config.Lifetime, function()
+			if rock.Parent then
+				TweenService:Create(rock, TweenInfo.new(0.5), { Transparency = 1 }):Play()
+			end
+		end)
+		Debris:AddItem(rock, Config.Lifetime + 0.6)
+	end
+end
+
+-- Шип = стеклянная оболочка + неоновое ядро + ромбовидный кончик; поднимается из-под земли.
+local function createSpike(position, up, height, width, groundPart)
+	local base = alignToUp(position, up) * CFrame.Angles(0, rng:NextNumber(0, math.pi * 2), 0)
+
+	local model = Instance.new("Model")
+	model.Name = "CrystalSpike"
+
+	local shell = makePart({
+		Name = "Shell",
+		Size = Vector3.new(width, height, width),
+		Material = Enum.Material.Glass,
+		Color = Config.Color,
+		Transparency = 0.25,
+		Reflectance = 0.15,
+		CFrame = CFrame.Angles(0, math.rad(45), 0),
+	})
+	shell.Parent = model
+
+	local core = makePart({
+		Name = "Core",
+		Size = Vector3.new(width * 0.4, height * 0.85, width * 0.4),
+		Material = Enum.Material.Neon,
+		Color = Config.CoreColor,
+		CFrame = CFrame.new(),
+	})
+	core.Parent = model
+
+	local tipSize = width * 0.72
+	local tip = makePart({
+		Name = "Tip",
+		Size = Vector3.new(tipSize, tipSize, tipSize),
+		Material = Enum.Material.Glass,
+		Color = Config.Color,
+		Transparency = 0.2,
+		CFrame = CFrame.new(0, height / 2, 0) * CFrame.Angles(math.rad(45), 0, math.rad(45)),
+	})
+	tip.Parent = model
+
+	local light = Instance.new("PointLight")
+	light.Color = Config.Color
+	light.Range = 10
+	light.Brightness = 1.5
+	light.Parent = core
+
+	local sparkles = Instance.new("ParticleEmitter")
+	sparkles.Color = ColorSequence.new(Config.CoreColor, Config.Color)
+	sparkles.LightEmission = 1
+	sparkles.Size = NumberSequence.new(0.4, 0)
+	sparkles.Speed = NumberRange.new(6, 14)
+	sparkles.SpreadAngle = Vector2.new(60, 60)
+	sparkles.Lifetime = NumberRange.new(0.3, 0.6)
+	sparkles.Rate = 0
+	sparkles.Parent = tip
+
+	model.PrimaryPart = shell
+
+	local finalCF = base * CFrame.new(0, height / 2 - 0.6, 0)
+	local startCF = base * CFrame.new(0, -height / 2 - 0.5, 0)
+	model:PivotTo(startCF)
+	model.Parent = effects
+
+	-- TweenService не умеет двигать модели, поэтому твиним CFrameValue и двигаем по нему.
+	local driver = Instance.new("CFrameValue")
+	driver.Value = startCF
+	driver.Changed:Connect(function(cf)
+		if model.Parent then
+			model:PivotTo(cf)
+		end
+	end)
+	local tween = TweenService:Create(
+		driver,
+		TweenInfo.new(Config.RiseTime, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		{ Value = finalCF }
+	)
+	tween.Completed:Connect(function()
+		driver:Destroy()
+	end)
+	tween:Play()
+
+	sparkles:Emit(12)
+	spawnRubble(position, groundPart, width)
+	return model
+end
+
+local function shatter(model)
+	local shell = model.PrimaryPart
+	if not shell then
+		model:Destroy()
+		return
+	end
+	local pivot = shell.CFrame
+	local size = shell.Size
+	for _ = 1, Config.ShardsPerSpike do
+		local shard = Instance.new("Part")
+		shard.Name = "Shard"
+		shard.Size = Vector3.new(rng:NextNumber(0.3, 0.8), rng:NextNumber(0.6, 1.4), rng:NextNumber(0.3, 0.8))
+		shard.CFrame = pivot
+			* CFrame.new(
+				rng:NextNumber(-size.X / 2, size.X / 2),
+				rng:NextNumber(-size.Y / 2, size.Y / 2),
+				rng:NextNumber(-size.Z / 2, size.Z / 2)
+			)
+			* CFrame.Angles(rng:NextNumber(0, 6.28), rng:NextNumber(0, 6.28), rng:NextNumber(0, 6.28))
+		shard.Material = Enum.Material.Glass
+		shard.Color = Config.Color
+		shard.Transparency = 0.2
+		shard.CanQuery = false
+		shard.CanTouch = false
+		shard.CastShadow = false
+		shard.Parent = effects
+
+		local outward = shard.Position - pivot.Position
+		outward = Vector3.new(outward.X, 0, outward.Z)
+		if outward.Magnitude < 0.1 then
+			outward = Vector3.xAxis
+		end
+		shard.AssemblyLinearVelocity = outward.Unit * rng:NextNumber(10, 22) + Vector3.new(0, rng:NextNumber(15, 30), 0)
+		shard.AssemblyAngularVelocity = rng:NextUnitVector() * 12
+
+		TweenService:Create(shard, TweenInfo.new(Config.ShardLifetime, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+			Transparency = 1,
+		}):Play()
+		Debris:AddItem(shard, Config.ShardLifetime)
+	end
+	model:Destroy()
+end
+
+local function applySlow(humanoid)
+	local token = (humanoid:GetAttribute("CrystalSlowToken") or 0) + 1
+	humanoid:SetAttribute("CrystalSlowToken", token)
+	if humanoid:GetAttribute("CrystalBaseSpeed") == nil then
+		humanoid:SetAttribute("CrystalBaseSpeed", humanoid.WalkSpeed)
+	end
+	humanoid.WalkSpeed = humanoid:GetAttribute("CrystalBaseSpeed") * Config.SlowMultiplier
+
+	-- Токен: повторное замедление продлевает эффект, а не восстанавливает скорость раньше времени.
+	task.delay(Config.SlowDuration, function()
+		if humanoid.Parent and humanoid:GetAttribute("CrystalSlowToken") == token then
+			humanoid.WalkSpeed = humanoid:GetAttribute("CrystalBaseSpeed")
+			humanoid:SetAttribute("CrystalBaseSpeed", nil)
+		end
+	end)
+end
+
+local function flash(model)
+	local highlight = Instance.new("Highlight")
+	highlight.FillColor = Config.Color
+	highlight.OutlineColor = Config.CoreColor
+	highlight.FillTransparency = 0.3
+	highlight.Parent = model
+	TweenService:Create(highlight, TweenInfo.new(0.5), { FillTransparency = 1, OutlineTransparency = 1 }):Play()
+	Debris:AddItem(highlight, 0.5)
+end
+
+local function knock(model, humanoid, root, velocity)
+	local victim = Players:GetPlayerFromCharacter(model)
+	if victim then
+		-- Персонажем игрока физически владеет его клиент, поэтому импульс применяет клиент.
+		remote:FireClient(victim, "Knock", velocity)
+	else
+		if root:CanSetNetworkOwnership() then
+			root:SetNetworkOwner(nil)
+		end
+		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+		root.AssemblyLinearVelocity = velocity
+	end
+end
+
+local function isAlly(caster, model)
+	if Config.FriendlyFire then
+		return false
+	end
+	local victim = Players:GetPlayerFromCharacter(model)
+	return victim ~= nil and not caster.Neutral and not victim.Neutral and victim.Team == caster.Team
+end
+
+local function damageArea(caster, center, radius, damage, hitSet, pushDirection)
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { effects, caster.Character }
+
+	for _, part in ipairs(workspace:GetPartBoundsInRadius(center, radius, params)) do
+		local model = part:FindFirstAncestorOfClass("Model")
+		if model and not hitSet[model] then
+			local humanoid, root = getAlive(model)
+			if humanoid and not isAlly(caster, model) then
+				hitSet[model] = true
+
+				local tag = Instance.new("ObjectValue")
+				tag.Name = "creator"
+				tag.Value = caster
+				tag.Parent = humanoid
+				Debris:AddItem(tag, 2)
+
+				humanoid:TakeDamage(damage)
+				applySlow(humanoid)
+				flash(model)
+
+				local push = pushDirection
+				if not push then
+					local away = root.Position - center
+					away = Vector3.new(away.X, 0, away.Z)
+					push = away.Magnitude > 0.1 and away.Unit or Vector3.zero
+				end
+				knock(model, humanoid, root, push * Config.KnockBack + Vector3.new(0, Config.KnockUp, 0))
+			end
+		end
+	end
+end
+
+local function shockwave(position)
+	local ring = makePart({
+		Name = "Shockwave",
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.3, 2, 2),
+		Material = Enum.Material.Neon,
+		Color = Config.CoreColor,
+		Transparency = 0.2,
+		CFrame = CFrame.new(position + Vector3.new(0, 0.3, 0)) * CFrame.Angles(0, 0, math.rad(90)),
+	})
+	ring.Parent = effects
+	local diameter = Config.FinaleRadius * 2.4
+	TweenService:Create(ring, TweenInfo.new(0.45, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+		Size = Vector3.new(0.3, diameter, diameter),
+		Transparency = 1,
+	}):Play()
+	Debris:AddItem(ring, 0.5)
+end
+
+local function finale(caster, center, normal, spawned)
+	shockwave(center)
+	table.insert(spawned, createSpike(center, normal, Config.FinaleCenterHeight, Config.SpikeWidth * 2, nil))
+
+	for i = 1, Config.FinaleSpikes do
+		local angle = (i / Config.FinaleSpikes) * math.pi * 2 + rng:NextNumber(-0.2, 0.2)
+		local outward = Vector3.new(math.cos(angle), 0, math.sin(angle))
+		local pos, groundNormal, groundPart = findGround(center + outward * rng:NextNumber(3.5, 5.5))
+		if pos then
+			local up = (groundNormal + outward * 0.8).Unit
+			local height = rng:NextNumber(Config.SpikeHeightMax * 0.8, Config.SpikeHeightMax * 1.2)
+			table.insert(spawned, createSpike(pos, up, height, Config.SpikeWidth * 1.3, groundPart))
+		end
+	end
+
+	damageArea(caster, center + Vector3.new(0, 2, 0), Config.FinaleRadius, Config.FinaleDamage, {}, nil)
+end
+
+local function runRift(caster, origin, direction, distance)
+	local hitSet = {}
+	local spawned = {}
+	local steps = math.max(1, math.floor((distance - Config.StartOffset) / Config.SpikeSpacing) + 1)
+	local lastGround, lastNormal = nil, nil
+	local previousPoint = origin
+
+	for i = 1, steps do
+		local flat = origin + direction * (Config.StartOffset + (i - 1) * Config.SpikeSpacing)
+		local probe = Vector3.new(flat.X, lastGround and lastGround.Y or origin.Y, flat.Z)
+		local pos, normal, groundPart = findGround(probe)
+
+		-- Волна обрывается над пропастью, на резком перепаде или упираясь в стену.
+		if not pos then
+			break
+		end
+		if lastGround and math.abs(pos.Y - lastGround.Y) > Config.MaxStepHeight then
+			break
+		end
+		if isBlocked(previousPoint, pos) then
+			break
+		end
+
+		local progress = steps > 1 and (i - 1) / (steps - 1) or 1
+		local height = lerp(Config.SpikeHeightMin, Config.SpikeHeightMax, progress) + rng:NextNumber(-1, 1)
+		local jitter = Vector3.new(rng:NextNumber(-1, 1), 0, rng:NextNumber(-1, 1)) * Config.SpikeJitter
+		local up = (normal + direction * Config.SpikeLean + jitter).Unit
+		table.insert(spawned, createSpike(pos, up, height, Config.SpikeWidth, groundPart))
+
+		damageArea(caster, pos + Vector3.new(0, 2, 0), Config.HitRadius, Config.Damage, hitSet, direction)
+
+		lastGround, lastNormal = pos, normal
+		previousPoint = pos
+		task.wait(Config.SpikeDelay)
+	end
+
+	if lastGround then
+		finale(caster, lastGround, lastNormal, spawned)
+	end
+
+	task.wait(Config.Lifetime)
+	for index, spike in ipairs(spawned) do
+		if spike.Parent then
+			shatter(spike)
+		end
+		-- Шипы рассыпаются волной, в том же порядке, в каком выросли.
+		if index % 2 == 0 then
+			task.wait(0.03)
+		end
+	end
+end
+
+remote.OnServerEvent:Connect(function(player, action, target)
+	if action ~= "Cast" or typeof(target) ~= "Vector3" then
+		return
+	end
+	local magnitude = target.Magnitude
+	if magnitude ~= magnitude or magnitude == math.huge then
+		return -- NaN / inf от клиента
+	end
+
+	local character = player.Character
+	if not character then
+		return
+	end
+	local humanoid, root = getAlive(character)
+	if not humanoid then
+		return
+	end
+
+	local now = os.clock()
+	local last = lastCast[player]
+	if last and now - last < Config.Cooldown then
+		remote:FireClient(player, "Cooldown", Config.Cooldown - (now - last))
+		return
+	end
+
+	local flat = Vector3.new(target.X - root.Position.X, 0, target.Z - root.Position.Z)
+	if flat.Magnitude < 1 then
+		local look = root.CFrame.LookVector
+		flat = Vector3.new(look.X, 0, look.Z)
+	end
+	if flat.Magnitude < 1e-3 then
+		return
+	end
+
+	lastCast[player] = now
+	remote:FireClient(player, "Cast", Config.Cooldown)
+
+	local distance = math.clamp(flat.Magnitude, Config.MinRange, Config.MaxRange)
+	task.spawn(runRift, player, root.Position, flat.Unit, distance)
+end)
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="Script" referent="5">
+      <Properties>
+        <string name="Name">Enemies</string>
+        <token name="RunContext">0</token>
+        <string name="Source"><![CDATA[-- Враги-ронины: преследуют ближайшего игрока, бьют вблизи, возрождаются. Плюс счёт убийств.
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+
+local ENEMY_COUNT = 6
+local SPAWN_RADIUS = 45
+local MAX_HEALTH = 120
+local WALK_SPEED = 13
+local AGGRO_RANGE = 80
+local ATTACK_RANGE = 5
+local ATTACK_DAMAGE = 10
+local ATTACK_COOLDOWN = 1.3
+local RESPAWN_TIME = 4
+local KILL_HEAL = 25
+
+local rng = Random.new()
+
+local function setupStats(player)
+	local stats = Instance.new("Folder")
+	stats.Name = "leaderstats"
+	local kills = Instance.new("IntValue")
+	kills.Name = "Убийства"
+	kills.Parent = stats
+	stats.Parent = player
+end
+
+Players.PlayerAdded:Connect(setupStats)
+for _, player in ipairs(Players:GetPlayers()) do
+	setupStats(player)
+end
+
+local function nearestPlayerRoot(position)
+	local best, bestDistance = nil, AGGRO_RANGE
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if humanoid and root and humanoid.Health > 0 then
+			local distance = (root.Position - position).Magnitude
+			if distance < bestDistance then
+				best, bestDistance = root, distance
+			end
+		end
+	end
+	return best, bestDistance
+end
+
+local function addHealthBar(model, humanoid)
+	local head = model:FindFirstChild("Head")
+	if not head then
+		return
+	end
+	humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+
+	local gui = Instance.new("BillboardGui")
+	gui.Size = UDim2.fromOffset(110, 30)
+	gui.StudsOffset = Vector3.new(0, 2.6, 0)
+	gui.AlwaysOnTop = true
+	gui.MaxDistance = 120
+	gui.Parent = head
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.new(1, 0, 0, 16)
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 14
+	label.TextColor3 = Color3.fromRGB(255, 120, 120)
+	label.TextStrokeTransparency = 0.3
+	label.Text = model.Name
+	label.Parent = gui
+
+	local back = Instance.new("Frame")
+	back.Position = UDim2.fromOffset(0, 18)
+	back.Size = UDim2.new(1, 0, 0, 8)
+	back.BackgroundColor3 = Color3.fromRGB(30, 10, 10)
+	back.BorderSizePixel = 0
+	back.Parent = gui
+
+	local fill = Instance.new("Frame")
+	fill.Size = UDim2.fromScale(1, 1)
+	fill.BackgroundColor3 = Color3.fromRGB(220, 40, 40)
+	fill.BorderSizePixel = 0
+	fill.Parent = back
+
+	humanoid.HealthChanged:Connect(function(health)
+		fill.Size = UDim2.fromScale(math.clamp(health / humanoid.MaxHealth, 0, 1), 1)
+	end)
+end
+
+local function attack(targetRoot)
+	local humanoid = targetRoot.Parent and targetRoot.Parent:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then
+		return
+	end
+	humanoid:TakeDamage(ATTACK_DAMAGE)
+
+	local highlight = Instance.new("Highlight")
+	highlight.FillColor = Color3.fromRGB(255, 0, 0)
+	highlight.FillTransparency = 0.4
+	highlight.OutlineTransparency = 1
+	highlight.Parent = targetRoot.Parent
+	TweenService:Create(highlight, TweenInfo.new(0.3), { FillTransparency = 1 }):Play()
+	Debris:AddItem(highlight, 0.3)
+end
+
+local function runAI(humanoid, root, home)
+	local lastAttack = 0
+	local nextWander = 0
+	while humanoid.Parent and humanoid.Health > 0 and root.Parent do
+		local target, distance = nearestPlayerRoot(root.Position)
+		if target then
+			humanoid:MoveTo(target.Position)
+			if distance <= ATTACK_RANGE and os.clock() - lastAttack >= ATTACK_COOLDOWN then
+				lastAttack = os.clock()
+				attack(target)
+			end
+		elseif os.clock() > nextWander then
+			nextWander = os.clock() + rng:NextNumber(2, 4)
+			humanoid:MoveTo(home + Vector3.new(rng:NextNumber(-10, 10), 0, rng:NextNumber(-10, 10)))
+		end
+		task.wait(0.2)
+	end
+end
+
+local function creditKill(humanoid)
+	local tag = humanoid:FindFirstChild("creator")
+	local killer = tag and tag.Value
+	if not (killer and killer:IsA("Player")) then
+		return
+	end
+	local stats = killer:FindFirstChild("leaderstats")
+	local kills = stats and stats:FindFirstChild("Убийства")
+	if kills then
+		kills.Value += 1
+	end
+	local killerHumanoid = killer.Character and killer.Character:FindFirstChildOfClass("Humanoid")
+	if killerHumanoid and killerHumanoid.Health > 0 then
+		killerHumanoid.Health = math.min(killerHumanoid.MaxHealth, killerHumanoid.Health + KILL_HEAL)
+	end
+end
+
+local spawnEnemy
+
+function spawnEnemy(home)
+	local description = Instance.new("HumanoidDescription")
+	local skin = Color3.fromRGB(70, 60, 60)
+	local cloth = Color3.fromRGB(120, 20, 25)
+	description.HeadColor = skin
+	description.LeftArmColor = skin
+	description.RightArmColor = skin
+	description.TorsoColor = cloth
+	description.LeftLegColor = Color3.fromRGB(25, 25, 30)
+	description.RightLegColor = Color3.fromRGB(25, 25, 30)
+
+	local model = Players:CreateHumanoidModelFromDescription(description, Enum.HumanoidRigType.R15)
+	model.Name = "Ронин"
+	model:PivotTo(CFrame.new(home + Vector3.new(0, 4, 0)))
+
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local root = model:FindFirstChild("HumanoidRootPart")
+	humanoid.MaxHealth = MAX_HEALTH
+	humanoid.Health = MAX_HEALTH
+	humanoid.WalkSpeed = WALK_SPEED
+	addHealthBar(model, humanoid)
+	model.Parent = workspace
+
+	-- Сервер владеет физикой NPC, чтобы отбросы от катаны срабатывали.
+	if root:CanSetNetworkOwnership() then
+		root:SetNetworkOwner(nil)
+	end
+
+	humanoid.Died:Connect(function()
+		creditKill(humanoid)
+		task.wait(RESPAWN_TIME)
+		model:Destroy()
+		spawnEnemy(home)
+	end)
+
+	task.spawn(runAI, humanoid, root, home)
+end
+
+for i = 1, ENEMY_COUNT do
+	local angle = (i / ENEMY_COUNT) * math.pi * 2
+	local home = Vector3.new(math.cos(angle) * SPAWN_RADIUS, 0, math.sin(angle) * SPAWN_RADIUS)
+	task.spawn(spawnEnemy, home)
+end
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="Script" referent="6">
+      <Properties>
+        <string name="Name">Katana</string>
+        <token name="RunContext">0</token>
+        <string name="Source"><![CDATA[-- Катана из партов: сборка модели, экипировка, удары и способности (сервер).
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterPack = game:GetService("StarterPack")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+
+local Config = require(ReplicatedStorage:WaitForChild("KatanaConfig"))
+
+local remote = Instance.new("RemoteEvent")
+remote.Name = Config.RemoteName
+remote.Parent = ReplicatedStorage
+
+local fx = Instance.new("Folder")
+fx.Name = Config.EffectsFolderName
+fx.Parent = workspace
+
+local rng = Random.new()
+
+local SOUNDS = {
+	Slash = "rbxasset://sounds/swordslash.wav",
+	Lunge = "rbxasset://sounds/swordlunge.wav",
+	Unsheath = "rbxasset://sounds/unsheath.wav",
+}
+
+local DARK = Color3.fromRGB(22, 22, 28)
+local GOLD = Color3.fromRGB(205, 165, 75)
+local STEEL = Color3.fromRGB(210, 215, 225)
+
+---------------------------------------------------------------------------
+-- Общие утилиты
+---------------------------------------------------------------------------
+
+local function newPart(className, props)
+	local part = Instance.new(className)
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	for key, value in pairs(props) do
+		part[key] = value
+	end
+	return part
+end
+
+local function fxPart(props)
+	props.Anchored = true
+	props.Material = props.Material or Enum.Material.Neon
+	return newPart("Part", props)
+end
+
+local function playSound(id, parent, volume, speed)
+	local sound = Instance.new("Sound")
+	sound.SoundId = id
+	sound.Volume = volume or 0.6
+	sound.PlaybackSpeed = speed or 1
+	sound.Parent = parent
+	sound:Play()
+	Debris:AddItem(sound, 3)
+end
+
+local function flat(v)
+	return Vector3.new(v.X, 0, v.Z)
+end
+
+local function flatDirection(root, aim)
+	local dir = flat(aim - root.Position)
+	if dir.Magnitude < 1 then
+		dir = flat(root.CFrame.LookVector)
+	end
+	if dir.Magnitude < 1e-3 then
+		return Vector3.new(0, 0, -1)
+	end
+	return dir.Unit
+end
+
+local function isValidVector(v)
+	if typeof(v) ~= "Vector3" then
+		return false
+	end
+	local m = v.Magnitude
+	return m == m and m ~= math.huge
+end
+
+local function isCharacterPart(instance)
+	local model = instance:FindFirstAncestorOfClass("Model")
+	return model ~= nil and model:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
+-- Луч, который пролетает сквозь персонажей и упирается только в стены.
+local function castThroughCharacters(origin, vector, ignore)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+	for _ = 1, 8 do
+		local result = workspace:Raycast(origin, vector, params)
+		if not result then
+			return nil
+		end
+		if isCharacterPart(result.Instance) then
+			params:AddToFilter(result.Instance:FindFirstAncestorOfClass("Model"))
+		else
+			return result
+		end
+	end
+	return nil
+end
+
+---------------------------------------------------------------------------
+-- Модель катаны
+---------------------------------------------------------------------------
+
+-- Лезвие идёт вдоль -Z от рукояти; все детали приварены к рукояти (Tsuka).
+local function buildKatana()
+	local model = Instance.new("Model")
+	model.Name = "KatanaModel"
+
+	local handle = newPart("Part", {
+		Name = "Tsuka",
+		Size = Vector3.new(0.22, 0.28, 1.3),
+		Color = DARK,
+		Material = Enum.Material.Fabric,
+		Massless = true,
+	})
+	handle.Parent = model
+	model.PrimaryPart = handle
+
+	local function attach(className, props, offset)
+		props.Massless = true
+		local part = newPart(className, props)
+		part.CFrame = offset
+		local weld = Instance.new("Weld")
+		weld.Part0 = handle
+		weld.Part1 = part
+		weld.C0 = offset
+		weld.Parent = part
+		part.Parent = model
+		return part
+	end
+
+	-- Навершие и обмотка рукояти
+	attach("Part", { Name = "Kashira", Size = Vector3.new(0.26, 0.32, 0.12), Color = GOLD, Material = Enum.Material.Metal }, CFrame.new(0, 0, 0.71))
+	for _, z in ipairs({ -0.45, -0.15, 0.15, 0.45 }) do
+		attach("Part", {
+			Name = "Ito",
+			Size = Vector3.new(0.235, 0.15, 0.15),
+			Color = Config.Color:Lerp(DARK, 0.5),
+			Material = Enum.Material.Fabric,
+		}, CFrame.new(0, 0, z) * CFrame.Angles(math.rad(45), 0, 0))
+	end
+
+	-- Гарда и муфта
+	attach("Part", {
+		Name = "Tsuba",
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.08, 0.75, 0.75),
+		Color = DARK,
+		Material = Enum.Material.Metal,
+		Reflectance = 0.2,
+	}, CFrame.new(0, 0, -0.69) * CFrame.Angles(0, math.rad(90), 0))
+	attach("Part", { Name = "Habaki", Size = Vector3.new(0.1, 0.3, 0.16), Color = GOLD, Material = Enum.Material.Metal }, CFrame.new(0, 0, -0.81))
+
+	-- Изогнутое лезвие из трёх сегментов + светящаяся кромка
+	local segmentLength = 1.25
+	local cf = CFrame.new(0, 0, -0.89)
+	for _ = 1, 3 do
+		cf = cf * CFrame.Angles(math.rad(3), 0, 0)
+		attach("Part", {
+			Name = "Blade",
+			Size = Vector3.new(0.06, 0.22, segmentLength + 0.04),
+			Color = STEEL,
+			Material = Enum.Material.Metal,
+			Reflectance = 0.35,
+		}, cf * CFrame.new(0, 0, -segmentLength / 2))
+		attach("Part", {
+			Name = "Edge",
+			Size = Vector3.new(0.066, 0.045, segmentLength + 0.04),
+			Color = Config.Color,
+			Material = Enum.Material.Neon,
+		}, cf * CFrame.new(0, -0.09, -segmentLength / 2))
+		cf = cf * CFrame.new(0, 0, -segmentLength)
+	end
+	local tip = attach("WedgePart", {
+		Name = "Kissaki",
+		Size = Vector3.new(0.06, 0.22, 0.4),
+		Color = STEEL,
+		Material = Enum.Material.Metal,
+		Reflectance = 0.35,
+	}, cf * CFrame.new(0, 0, -0.2))
+
+	local light = Instance.new("PointLight")
+	light.Color = Config.Color
+	light.Range = 6
+	light.Brightness = 1.2
+	light.Parent = tip
+
+	local a0 = Instance.new("Attachment")
+	a0.Name = "TrailBase"
+	a0.Position = Vector3.new(0, 0, -1.1)
+	a0.Parent = handle
+	local a1 = Instance.new("Attachment")
+	a1.Name = "TrailTip"
+	a1.Position = (cf * CFrame.new(0, 0, -0.4)).Position
+	a1.Parent = handle
+
+	local trail = Instance.new("Trail")
+	trail.Attachment0 = a0
+	trail.Attachment1 = a1
+	trail.Color = ColorSequence.new(Config.CoreColor, Config.Color)
+	trail.LightEmission = 1
+	trail.Lifetime = 0.2
+	trail.MinLength = 0
+	trail.Transparency = NumberSequence.new(0.1, 1)
+	trail.Enabled = false
+	trail.Parent = handle
+
+	return model, trail
+end
+
+-- Положения катаны относительно тела (в руке / на поясе), для R15 и R6.
+local function holdOffset(isR15)
+	local y = isR15 and -0.15 or -0.9
+	return CFrame.new(0, y, 0) * CFrame.Angles(math.rad(15), 0, 0) * CFrame.new(0, 0, -0.2)
+end
+
+local function sheathOffset(isR15)
+	local base = isR15 and CFrame.new(-1.05, 0.1, 0) or CFrame.new(-1.1, -0.8, 0)
+	return base * CFrame.Angles(math.rad(210), 0, 0) * CFrame.new(0, 0, -0.6)
+end
+
+local katanas = {} -- [character] = { model, trail, mount, hand, hip, isR15 }
+
+local function setHeld(kat, held)
+	kat.mount.Part0 = held and kat.hand or kat.hip
+	kat.mount.C0 = held and holdOffset(kat.isR15) or sheathOffset(kat.isR15)
+end
+
+local function setupCharacter(character)
+	local humanoid = character:WaitForChild("Humanoid", 10)
+	if not humanoid then
+		return
+	end
+	local isR15 = humanoid.RigType == Enum.HumanoidRigType.R15
+	local hand = character:WaitForChild(isR15 and "RightHand" or "Right Arm", 10)
+	local hip = character:WaitForChild(isR15 and "LowerTorso" or "Torso", 10)
+	if not hand or not hip then
+		return
+	end
+
+	local model, trail = buildKatana()
+	local mount = Instance.new("Weld")
+	mount.Name = "KatanaMount"
+	mount.Part1 = model.PrimaryPart
+	mount.Parent = model.PrimaryPart
+
+	local kat = { model = model, trail = trail, mount = mount, hand = hand, hip = hip, isR15 = isR15, trailToken = 0 }
+	setHeld(kat, false)
+	model.Parent = character
+	katanas[character] = kat
+
+	character.ChildAdded:Connect(function(child)
+		if child:IsA("Tool") and child.Name == Config.ToolName then
+			setHeld(kat, true)
+			playSound(SOUNDS.Unsheath, hand, 0.5)
+		end
+	end)
+	character.ChildRemoved:Connect(function(child)
+		if child:IsA("Tool") and child.Name == Config.ToolName then
+			setHeld(kat, false)
+		end
+	end)
+	character.Destroying:Connect(function()
+		katanas[character] = nil
+	end)
+end
+
+local function enableTrail(kat, duration)
+	kat.trailToken += 1
+	local token = kat.trailToken
+	kat.trail.Enabled = true
+	task.delay(duration, function()
+		if kat.trailToken == token then
+			kat.trail.Enabled = false
+		end
+	end)
+end
+
+-- Процедурная анимация: крутим плечевой сустав в пространстве торса (работает и для R15, и для R6).
+local function getShoulder(character)
+	local upper = character:FindFirstChild("RightUpperArm")
+	if upper then
+		return upper:FindFirstChild("RightShoulder")
+	end
+	local torso = character:FindFirstChild("Torso")
+	return torso and torso:FindFirstChild("Right Shoulder")
+end
+
+local function swingArm(character, keyframes)
+	local shoulder = getShoulder(character)
+	if not shoulder then
+		return
+	end
+	local base = shoulder:GetAttribute("KatanaBaseC0")
+	if not base then
+		base = shoulder.C0
+		shoulder:SetAttribute("KatanaBaseC0", base)
+	end
+	local token = (shoulder:GetAttribute("KatanaSwing") or 0) + 1
+	shoulder:SetAttribute("KatanaSwing", token)
+
+	task.spawn(function()
+		for _, frame in ipairs(keyframes) do
+			if not shoulder.Parent or shoulder:GetAttribute("KatanaSwing") ~= token then
+				return
+			end
+			local target = CFrame.new(base.Position) * frame[1] * base.Rotation
+			TweenService:Create(shoulder, TweenInfo.new(frame[2], Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { C0 = target }):Play()
+			task.wait(frame[2])
+		end
+	end)
+end
+
+local function deg(x, y, z)
+	return CFrame.Angles(math.rad(x), math.rad(y), math.rad(z))
+end
+
+---------------------------------------------------------------------------
+-- Визуальные эффекты
+---------------------------------------------------------------------------
+
+-- Полумесяц из неоновых сегментов вокруг начала координат, дугой вперёд (-Z).
+local function buildCrescent(radius, sweepDeg, thickness, segments)
+	local model = Instance.new("Model")
+	model.Name = "Crescent"
+	local sweep = math.rad(sweepDeg)
+	local step = sweep / segments
+	local length = 2 * radius * math.sin(step / 2) + 0.2
+	for i = 0, segments - 1 do
+		local angle = -sweep / 2 + step * (i + 0.5)
+		local taper = math.sin(((i + 0.5) / segments) * math.pi)
+		local part = fxPart({
+			Name = "Segment",
+			Size = Vector3.new(math.max(thickness * taper, 0.08), 0.15, length),
+			Color = i % 3 == 1 and Config.CoreColor or Config.Color,
+			Transparency = 0.05,
+			CFrame = CFrame.Angles(0, angle, 0) * CFrame.new(0, 0, -radius) * CFrame.Angles(0, math.rad(90), 0),
+		})
+		part.Parent = model
+	end
+	model.WorldPivot = CFrame.new()
+	return model
+end
+
+local function slashArc(cframe, radius, sweepDeg, thickness, duration, segments)
+	local arc = buildCrescent(radius, sweepDeg, thickness, segments or 12)
+	arc:PivotTo(cframe)
+	arc.Parent = fx
+	for _, part in ipairs(arc:GetChildren()) do
+		local outward = part.Position - cframe.Position
+		local push = outward.Magnitude > 0.01 and outward.Unit * radius * 0.3 or Vector3.zero
+		TweenService:Create(part, TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+			Transparency = 1,
+			CFrame = part.CFrame + push,
+		}):Play()
+	end
+	Debris:AddItem(arc, duration + 0.05)
+end
+
+local function impactBurst(position, size)
+	local sphere = fxPart({
+		Name = "Burst",
+		Shape = Enum.PartType.Ball,
+		Size = Vector3.one,
+		Color = Config.CoreColor,
+		Transparency = 0.1,
+		CFrame = CFrame.new(position),
+	})
+	local sparks = Instance.new("ParticleEmitter")
+	sparks.Color = ColorSequence.new(Config.CoreColor, Config.Color)
+	sparks.LightEmission = 1
+	sparks.Size = NumberSequence.new(0.5, 0)
+	sparks.Speed = NumberRange.new(20, 40)
+	sparks.SpreadAngle = Vector2.new(180, 180)
+	sparks.Lifetime = NumberRange.new(0.3, 0.6)
+	sparks.Drag = 4
+	sparks.Rate = 0
+	sparks.Parent = sphere
+	sphere.Parent = fx
+	sparks:Emit(30)
+	TweenService:Create(sphere, TweenInfo.new(0.35, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+		Size = Vector3.one * size,
+		Transparency = 1,
+	}):Play()
+	Debris:AddItem(sphere, 0.8)
+end
+
+local function shockRing(position, diameter)
+	local ring = fxPart({
+		Name = "Shockwave",
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.3, 2, 2),
+		Color = Config.Color,
+		Transparency = 0.15,
+		CFrame = CFrame.new(position) * CFrame.Angles(0, 0, math.rad(90)),
+	})
+	ring.Parent = fx
+	TweenService:Create(ring, TweenInfo.new(0.45, Enum.EasingStyle.Quart, Enum.EasingDirection.Out), {
+		Size = Vector3.new(0.3, diameter, diameter),
+		Transparency = 1,
+	}):Play()
+	Debris:AddItem(ring, 0.5)
+end
+
+-- Неоновый «призрак» персонажа на месте, откуда он рванул.
+local function afterimage(character, offset)
+	local ghost = Instance.new("Model")
+	ghost.Name = "Afterimage"
+	for _, part in ipairs(character:GetDescendants()) do
+		if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" and part.Transparency < 1
+			and not part:FindFirstAncestor("KatanaModel") and not part:FindFirstAncestorOfClass("Accessory") then
+			local copy = fxPart({
+				Name = "Ghost",
+				Size = part.Size,
+				CFrame = part.CFrame + offset,
+				Color = Config.Color,
+				Transparency = 0.4,
+			})
+			copy.Parent = ghost
+			TweenService:Create(copy, TweenInfo.new(0.4), { Transparency = 1 }):Play()
+		end
+	end
+	ghost.Parent = fx
+	Debris:AddItem(ghost, 0.45)
+end
+
+local function damageNumber(position, amount, big)
+	local anchor = fxPart({
+		Name = "DamageNumber",
+		Size = Vector3.new(0.1, 0.1, 0.1),
+		Transparency = 1,
+		CFrame = CFrame.new(position + Vector3.new(rng:NextNumber(-1, 1), 0, rng:NextNumber(-1, 1))),
+	})
+	local gui = Instance.new("BillboardGui")
+	gui.Size = UDim2.fromOffset(big and 120 or 80, big and 50 or 34)
+	gui.AlwaysOnTop = true
+	gui.LightInfluence = 0
+	gui.Parent = anchor
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBlack
+	label.TextScaled = true
+	label.Text = tostring(math.floor(amount + 0.5))
+	label.TextColor3 = big and Config.Color or Color3.new(1, 1, 1)
+	label.TextStrokeTransparency = 0
+	label.Parent = gui
+	anchor.Parent = fx
+	TweenService:Create(anchor, TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		CFrame = anchor.CFrame + Vector3.new(0, 3.5, 0),
+	}):Play()
+	TweenService:Create(label, TweenInfo.new(0.8, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+		TextTransparency = 1,
+		TextStrokeTransparency = 1,
+	}):Play()
+	Debris:AddItem(anchor, 0.85)
+end
+
+---------------------------------------------------------------------------
+-- Урон
+---------------------------------------------------------------------------
+
+local function getAlive(model)
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if humanoid and root and humanoid.Health > 0 then
+		return humanoid, root
+	end
+	return nil, nil
+end
+
+local function isAlly(attacker, model)
+	local victim = Players:GetPlayerFromCharacter(model)
+	return victim ~= nil and not attacker.Neutral and not victim.Neutral and victim.Team == attacker.Team
+end
+
+local function flash(model)
+	local highlight = Instance.new("Highlight")
+	highlight.FillColor = Color3.new(1, 1, 1)
+	highlight.OutlineColor = Config.Color
+	highlight.FillTransparency = 0.2
+	highlight.Parent = model
+	TweenService:Create(highlight, TweenInfo.new(0.3), { FillTransparency = 1, OutlineTransparency = 1 }):Play()
+	Debris:AddItem(highlight, 0.3)
+end
+
+local function knock(model, humanoid, root, velocity)
+	local victim = Players:GetPlayerFromCharacter(model)
+	if victim then
+		-- Физикой персонажа владеет его клиент — отброс применяет он.
+		remote:FireClient(victim, "Knock", velocity)
+	else
+		if root:CanSetNetworkOwnership() then
+			root:SetNetworkOwner(nil)
+		end
+		humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+		root.AssemblyLinearVelocity = velocity
+	end
+end
+
+local function dealDamage(attacker, model, damage, knockVelocity, big)
+	local humanoid, root = getAlive(model)
+	if not humanoid then
+		return
+	end
+	local tag = Instance.new("ObjectValue")
+	tag.Name = "creator"
+	tag.Value = attacker
+	tag.Parent = humanoid
+	Debris:AddItem(tag, 2)
+
+	humanoid:TakeDamage(damage)
+	flash(model)
+	damageNumber(root.Position + Vector3.new(0, 3, 0), damage, big)
+	if knockVelocity then
+		knock(model, humanoid, root, knockVelocity)
+	end
+end
+
+local function overlapParams(character)
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { fx, character }
+	return params
+end
+
+-- Вызывает callback один раз для каждого живого врага среди найденных деталей.
+local function forEachTarget(attacker, parts, hitSet, callback)
+	for _, part in ipairs(parts) do
+		local model = part:FindFirstAncestorOfClass("Model")
+		if model and model ~= attacker.Character and not hitSet[model] then
+			local humanoid, root = getAlive(model)
+			if humanoid and not isAlly(attacker, model) then
+				hitSet[model] = true
+				callback(model, root)
+			end
+		end
+	end
+end
+
+---------------------------------------------------------------------------
+-- Состояние игрока и перезарядки
+---------------------------------------------------------------------------
+
+local states = {}
+
+local function getState(player)
+	local state = states[player]
+	if not state then
+		state = { ready = {}, combo = 0, lastSlash = 0, busyUntil = 0 }
+		states[player] = state
+	end
+	return state
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	states[player] = nil
+end)
+
+local function getContext(player)
+	local character = player.Character
+	if not character or not character:FindFirstChild(Config.ToolName) then
+		return nil
+	end
+	local humanoid, root = getAlive(character)
+	local kat = katanas[character]
+	if not humanoid or not kat then
+		return nil
+	end
+	return character, humanoid, root, kat
+end
+
+local function tryUse(player, ability, cooldown)
+	local state = getState(player)
+	local now = os.clock()
+	if now < state.busyUntil or now < (state.ready[ability] or 0) then
+		return false
+	end
+	state.ready[ability] = now + cooldown
+	remote:FireClient(player, "Cooldown", ability, cooldown)
+	return true
+end
+
+---------------------------------------------------------------------------
+-- Способности
+---------------------------------------------------------------------------
+
+local COMBO = {
+	{ windup = deg(120, 0, 35), strike = deg(35, 0, -45), roll = 25 },
+	{ windup = deg(80, 0, -50), strike = deg(90, 0, 60), roll = -20 },
+	{ windup = deg(170, 0, 0), strike = deg(30, 0, 0), roll = 80 },
+}
+
+local function doSlash(player)
+	local character, _, root, kat = getContext(player)
+	if not character or not tryUse(player, "Slash", Config.Slash.Cooldown) then
+		return
+	end
+
+	local state = getState(player)
+	local now = os.clock()
+	if now - state.lastSlash > Config.Slash.ComboWindow or state.combo >= #COMBO then
+		state.combo = 0
+	end
+	state.combo += 1
+	state.lastSlash = now
+
+	local index = state.combo
+	local step = COMBO[index]
+	local finisher = index == #COMBO
+
+	swingArm(character, { { step.windup, 0.07 }, { step.strike, 0.1 }, { CFrame.identity, 0.2 } })
+	enableTrail(kat, 0.3)
+	playSound(SOUNDS.Slash, root, 0.6, finisher and 0.8 or rng:NextNumber(1, 1.15))
+	remote:FireClient(player, "Slash", index)
+
+	task.delay(0.08, function()
+		if not root.Parent then
+			return
+		end
+		local look = root.CFrame.LookVector
+		slashArc(root.CFrame * CFrame.new(0, 0.5, 0) * deg(0, 0, step.roll), finisher and 7 or 5.5, finisher and 200 or 150, finisher and 1.4 or 1, 0.25)
+
+		local range = Config.Slash.Range * (finisher and 1.3 or 1)
+		local parts = workspace:GetPartBoundsInBox(root.CFrame * CFrame.new(0, 0, -range / 2), Vector3.new(Config.Slash.Width, 7, range), overlapParams(character))
+		forEachTarget(player, parts, {}, function(model)
+			local push = finisher and (look * Config.Slash.FinisherKnock + Vector3.new(0, 25, 0)) or look * 8
+			dealDamage(player, model, Config.Slash.Damage[index], push, finisher)
+		end)
+	end)
+end
+
+local function launchWave(player, character, origin, direction)
+	local W = Config.Wave
+	local radius = W.Width / 2
+	local crescent = buildCrescent(radius, 150, 1.8, 16)
+	local cf = CFrame.lookAt(origin, origin + direction) * deg(0, 0, 12)
+	crescent:PivotTo(cf)
+
+	local sparks = Instance.new("ParticleEmitter")
+	sparks.Color = ColorSequence.new(Config.CoreColor, Config.Color)
+	sparks.LightEmission = 1
+	sparks.Size = NumberSequence.new(0.4, 0)
+	sparks.Speed = NumberRange.new(2, 6)
+	sparks.Lifetime = NumberRange.new(0.2, 0.4)
+	sparks.Rate = 80
+	sparks.Parent = crescent:GetChildren()[8]
+	crescent.Parent = fx
+
+	local traveled = 0
+	local hitSet = {}
+	local params = overlapParams(character)
+	local finished = false
+	local connection
+
+	local function finish(impactPosition)
+		if finished then
+			return
+		end
+		finished = true
+		connection:Disconnect()
+		if impactPosition then
+			impactBurst(impactPosition, 8)
+		end
+		sparks.Enabled = false
+		for _, part in ipairs(crescent:GetChildren()) do
+			TweenService:Create(part, TweenInfo.new(0.2), { Transparency = 1 }):Play()
+		end
+		Debris:AddItem(crescent, 0.5)
+	end
+
+	connection = RunService.Heartbeat:Connect(function(dt)
+		local distance = W.Speed * dt
+		local front = (cf * CFrame.new(0, 0, -radius)).Position
+		local wall = castThroughCharacters(front, direction * distance, { fx, character })
+		if wall then
+			finish(wall.Position)
+			return
+		end
+
+		cf = cf + direction * distance
+		traveled += distance
+		crescent:PivotTo(cf)
+
+		local parts = workspace:GetPartBoundsInBox(cf * CFrame.new(0, 0, -radius * 0.6), Vector3.new(W.Width, W.Height, radius * 1.2), params)
+		forEachTarget(player, parts, hitSet, function(model, targetRoot)
+			impactBurst(targetRoot.Position, 5)
+			dealDamage(player, model, W.Damage, direction * 35 + Vector3.new(0, 22, 0), true)
+		end)
+
+		if traveled >= W.Range then
+			finish(nil)
+		end
+	end)
+end
+
+local function doWave(player, aim)
+	local character, _, root, kat = getContext(player)
+	if not character or not tryUse(player, "Wave", Config.Wave.Cooldown) then
+		return
+	end
+	local direction = flatDirection(root, aim)
+	swingArm(character, { { deg(90, 0, -70), 0.08 }, { deg(90, 0, 70), 0.1 }, { CFrame.identity, 0.25 } })
+	enableTrail(kat, 0.3)
+	playSound(SOUNDS.Lunge, root, 0.7, 1.1)
+	remote:FireClient(player, "Wave")
+	task.delay(0.1, function()
+		if root.Parent then
+			launchWave(player, character, root.Position + Vector3.new(0, 0.5, 0), direction)
+		end
+	end)
+end
+
+local function doDash(player, aim)
+	local character, _, root, kat = getContext(player)
+	if not character or not tryUse(player, "Dash", Config.Dash.Cooldown) then
+		return
+	end
+	local D = Config.Dash
+	local state = getState(player)
+	state.busyUntil = os.clock() + 0.25
+
+	local direction = flatDirection(root, aim)
+	local start = root.Position
+	local wall = castThroughCharacters(start, direction * D.Distance, { fx, character })
+	local distance = wall and math.max(0, (wall.Position - start).Magnitude - 2.5) or D.Distance
+	local finish = start + direction * distance
+
+	for i = 0, 3 do
+		afterimage(character, direction * distance * (i / 4))
+	end
+
+	if distance > 0.5 then
+		local line = fxPart({
+			Name = "DashLine",
+			Size = Vector3.new(0.35, 0.35, distance),
+			Color = Config.CoreColor,
+			CFrame = CFrame.lookAt((start + finish) / 2, finish),
+		})
+		line.Parent = fx
+		TweenService:Create(line, TweenInfo.new(0.4), { Transparency = 1, Size = Vector3.new(0.05, 0.05, distance) }):Play()
+		Debris:AddItem(line, 0.45)
+	end
+
+	character:PivotTo(CFrame.lookAt(finish, finish + direction))
+	swingArm(character, { { deg(30, 0, -60), 0.05 }, { deg(100, 0, 60), 0.12 }, { CFrame.identity, 0.25 } })
+	enableTrail(kat, 0.35)
+	playSound(SOUNDS.Lunge, root, 0.8, 0.9)
+	remote:FireClient(player, "Dash")
+
+	if distance <= 0.5 then
+		return
+	end
+	local parts = workspace:GetPartBoundsInBox(CFrame.lookAt((start + finish) / 2, finish), Vector3.new(D.Width, 7, distance + 4), overlapParams(character))
+	local victims = {}
+	forEachTarget(player, parts, {}, function(model, targetRoot)
+		table.insert(victims, { model = model, root = targetRoot })
+	end)
+
+	-- Удар «догоняет» жертв чуть позже — эффект мгновенного пореза.
+	task.delay(0.18, function()
+		for _, victim in ipairs(victims) do
+			if victim.root.Parent then
+				slashArc(CFrame.new(victim.root.Position) * deg(0, rng:NextNumber(0, 360), rng:NextNumber(-60, 60)), 3.5, 160, 0.8, 0.25)
+				dealDamage(player, victim.model, D.Damage, direction * 15 + Vector3.new(0, 30, 0), true)
+			end
+		end
+		if #victims > 0 then
+			playSound(SOUNDS.Slash, root, 0.8, 0.7)
+		end
+	end)
+end
+
+local function doUltimate(player)
+	local character, humanoid, root, kat = getContext(player)
+	if not character or not tryUse(player, "Ultimate", Config.Ultimate.Cooldown) then
+		return
+	end
+	local U = Config.Ultimate
+	local duration = U.Hits * U.Interval + 0.4
+	getState(player).busyUntil = os.clock() + duration
+
+	root.Anchored = true
+	remote:FireClient(player, "Ultimate", duration)
+	playSound(SOUNDS.Unsheath, root, 0.9, 0.8)
+
+	task.spawn(function()
+		local ok, err = pcall(function()
+			local params = overlapParams(character)
+			for _ = 1, U.Hits do
+				if not root.Parent or humanoid.Health <= 0 then
+					return
+				end
+				local center = root.Position
+				slashArc(
+					CFrame.new(center) * deg(0, rng:NextNumber(0, 360), rng:NextNumber(-70, 70)),
+					rng:NextNumber(U.Radius * 0.5, U.Radius * 0.9),
+					220,
+					1.2,
+					0.3
+				)
+				swingArm(character, { { deg(rng:NextNumber(60, 170), 0, rng:NextNumber(-60, 60)), 0.05 }, { deg(rng:NextNumber(20, 90), 0, rng:NextNumber(-60, 60)), 0.06 } })
+				enableTrail(kat, 0.2)
+				playSound(SOUNDS.Slash, root, 0.5, rng:NextNumber(0.9, 1.3))
+				forEachTarget(player, workspace:GetPartBoundsInRadius(center, U.Radius, params), {}, function(model)
+					dealDamage(player, model, U.Damage, Vector3.new(0, 8, 0), false)
+				end)
+				task.wait(U.Interval)
+			end
+
+			local center = root.Position
+			slashArc(CFrame.new(center), U.Radius, 360, 2.5, 0.5, 28)
+			shockRing(center - Vector3.new(0, 2.5, 0), U.Radius * 2.6)
+			impactBurst(center, 10)
+			swingArm(character, { { deg(90, 0, -80), 0.05 }, { deg(90, 0, 80), 0.12 }, { CFrame.identity, 0.25 } })
+			playSound(SOUNDS.Lunge, root, 1, 0.6)
+			forEachTarget(player, workspace:GetPartBoundsInRadius(center, U.Radius * 1.1, params), {}, function(model, targetRoot)
+				local away = flat(targetRoot.Position - center)
+				away = away.Magnitude > 0.1 and away.Unit or Vector3.zero
+				dealDamage(player, model, U.FinalDamage, away * 60 + Vector3.new(0, 40, 0), true)
+			end)
+		end)
+		if root.Parent then
+			root.Anchored = false
+		end
+		if not ok then
+			warn("Katana ultimate error:", err)
+		end
+	end)
+end
+
+remote.OnServerEvent:Connect(function(player, action, aim)
+	if action == "Slash" then
+		doSlash(player)
+	elseif not isValidVector(aim) then
+		return
+	elseif action == "Wave" then
+		doWave(player, aim)
+	elseif action == "Dash" then
+		doDash(player, aim)
+	elseif action == "Ultimate" then
+		doUltimate(player)
+	end
+end)
+
+---------------------------------------------------------------------------
+-- Выдача инструмента
+---------------------------------------------------------------------------
+
+local tool = Instance.new("Tool")
+tool.Name = Config.ToolName
+tool.RequiresHandle = false -- модель вешаем на руку сами, чтобы не зависеть от Grip
+tool.CanBeDropped = false
+tool.ToolTip = "ЛКМ — удар, Q — волна, R — рывок, F — буря клинков"
+tool.Parent = StarterPack
+
+local function onPlayer(player)
+	player.CharacterAdded:Connect(setupCharacter)
+	if player.Character then
+		task.spawn(setupCharacter, player.Character)
+		local backpack = player:FindFirstChildOfClass("Backpack")
+		if backpack and not backpack:FindFirstChild(Config.ToolName) then
+			tool:Clone().Parent = backpack
+		end
+	end
+end
+
+Players.PlayerAdded:Connect(onPlayer)
+for _, player in ipairs(Players:GetPlayers()) do
+	onPlayer(player)
+end
+]]></string>
+      </Properties>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="7">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="8">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="LocalScript" referent="9">
+        <Properties>
+          <string name="Name">CrystalRiftClient</string>
+          <string name="Source"><![CDATA[-- Клиент «Кристального разлома»: прицел, ввод (клавиатура / геймпад / тач), UI перезарядки, отброс, тряска камеры.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local Config = require(ReplicatedStorage:WaitForChild("CrystalRiftConfig"))
+local remote = ReplicatedStorage:WaitForChild(Config.RemoteName)
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+local ACTION = "CrystalRift"
+local aiming = false
+local cooldownEnd = 0
+local cooldownTotal = Config.Cooldown
+local shakeAmount = 0
+
+-- UI ------------------------------------------------------------------------
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "CrystalRiftUI"
+gui.ResetOnSpawn = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local panel = Instance.new("Frame")
+panel.AnchorPoint = Vector2.new(0.5, 1)
+panel.Position = UDim2.new(0.5, 0, 1, -100)
+panel.Size = UDim2.fromOffset(240, 52)
+panel.BackgroundColor3 = Color3.fromRGB(18, 24, 36)
+panel.BackgroundTransparency = 0.15
+panel.Parent = gui
+Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
+local stroke = Instance.new("UIStroke", panel)
+stroke.Color = Config.Color
+stroke.Thickness = 2
+
+local title = Instance.new("TextLabel")
+title.BackgroundTransparency = 1
+title.Position = UDim2.fromOffset(12, 6)
+title.Size = UDim2.new(1, -24, 0, 20)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 15
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Text = "[" .. Config.Key.Name .. "] Кристальный разлом"
+title.Parent = panel
+
+local status = Instance.new("TextLabel")
+status.BackgroundTransparency = 1
+status.Position = UDim2.fromOffset(12, 6)
+status.Size = UDim2.new(1, -24, 0, 20)
+status.Font = Enum.Font.GothamBold
+status.TextSize = 15
+status.TextXAlignment = Enum.TextXAlignment.Right
+status.TextColor3 = Config.Color
+status.Parent = panel
+
+local barBack = Instance.new("Frame")
+barBack.Position = UDim2.new(0, 12, 1, -18)
+barBack.Size = UDim2.new(1, -24, 0, 8)
+barBack.BackgroundColor3 = Color3.fromRGB(40, 50, 70)
+barBack.BorderSizePixel = 0
+barBack.Parent = panel
+Instance.new("UICorner", barBack).CornerRadius = UDim.new(1, 0)
+
+local barFill = Instance.new("Frame")
+barFill.Size = UDim2.fromScale(1, 1)
+barFill.BackgroundColor3 = Config.Color
+barFill.BorderSizePixel = 0
+barFill.Parent = barBack
+Instance.new("UICorner", barFill).CornerRadius = UDim.new(1, 0)
+
+local function pulsePanel(color)
+	stroke.Color = color
+	TweenService:Create(stroke, TweenInfo.new(0.4), { Color = Config.Color }):Play()
+end
+
+-- Прицел (локальные детали под камерой видны только этому игроку) --------------
+
+local function makeIndicatorPart(shape)
+	local part = Instance.new("Part")
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Material = Enum.Material.Neon
+	part.Color = Config.Color
+	part.Transparency = 0.55
+	part.Shape = shape
+	return part
+end
+
+local pathIndicator = makeIndicatorPart(Enum.PartType.Block)
+local endIndicator = makeIndicatorPart(Enum.PartType.Cylinder)
+
+local function getAimPoint()
+	local ignore = { camera }
+	if player.Character then
+		table.insert(ignore, player.Character)
+	end
+	local effects = workspace:FindFirstChild(Config.EffectsFolderName)
+	if effects then
+		table.insert(ignore, effects)
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+
+	-- На тач-устройствах нет курсора: целимся в центр экрана.
+	local screenPoint
+	if UserInputService.TouchEnabled and not UserInputService.MouseEnabled then
+		screenPoint = camera.ViewportSize / 2
+	else
+		screenPoint = UserInputService:GetMouseLocation()
+	end
+	local ray = camera:ViewportPointToRay(screenPoint.X, screenPoint.Y)
+	local result = workspace:Raycast(ray.Origin, ray.Direction * 500, params)
+	return result and result.Position or (ray.Origin + ray.Direction * 500)
+end
+
+local function getRoot()
+	local character = player.Character
+	if not character then
+		return nil, nil
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if humanoid and root and humanoid.Health > 0 then
+		return humanoid, root
+	end
+	return nil, nil
+end
+
+local function updateIndicator()
+	local humanoid, root = getRoot()
+	if not root then
+		return
+	end
+	local target = getAimPoint()
+	local flat = Vector3.new(target.X - root.Position.X, 0, target.Z - root.Position.Z)
+	if flat.Magnitude < 1 then
+		local look = root.CFrame.LookVector
+		flat = Vector3.new(look.X, 0, look.Z)
+	end
+	local direction = flat.Unit
+	local distance = math.clamp(flat.Magnitude, Config.MinRange, Config.MaxRange)
+
+	local groundY = root.Position.Y - humanoid.HipHeight - root.Size.Y / 2 + 0.1
+	local start = Vector3.new(root.Position.X, groundY, root.Position.Z) + direction * Config.StartOffset
+	local finish = Vector3.new(root.Position.X, groundY, root.Position.Z) + direction * distance
+	local length = math.max((finish - start).Magnitude, 0.5)
+
+	local color = os.clock() < cooldownEnd and Color3.fromRGB(255, 90, 90) or Config.Color
+	pathIndicator.Color = color
+	endIndicator.Color = color
+
+	pathIndicator.Size = Vector3.new(Config.SpikeWidth, 0.15, length)
+	pathIndicator.CFrame = CFrame.lookAt((start + finish) / 2, finish)
+
+	local diameter = Config.FinaleRadius * 2
+	endIndicator.Size = Vector3.new(0.15, diameter, diameter)
+	endIndicator.CFrame = CFrame.new(finish) * CFrame.Angles(0, os.clock() * 2, math.rad(90))
+end
+
+local function startAim()
+	aiming = true
+	pathIndicator.Parent = camera
+	endIndicator.Parent = camera
+	RunService:BindToRenderStep("CrystalRiftAim", Enum.RenderPriority.Camera.Value + 2, updateIndicator)
+end
+
+local function stopAim()
+	aiming = false
+	RunService:UnbindFromRenderStep("CrystalRiftAim")
+	pathIndicator.Parent = nil
+	endIndicator.Parent = nil
+end
+
+local function tryCast()
+	if os.clock() < cooldownEnd then
+		pulsePanel(Color3.fromRGB(255, 90, 90))
+		return
+	end
+	if not getRoot() then
+		return
+	end
+	remote:FireServer("Cast", getAimPoint())
+end
+
+-- Ввод: зажать — прицел, отпустить — каст. Для тача CAS сам создаёт кнопку.
+local function onAction(_, state)
+	if state == Enum.UserInputState.Begin then
+		startAim()
+	elseif state == Enum.UserInputState.End then
+		if aiming then
+			stopAim()
+			tryCast()
+		end
+	elseif state == Enum.UserInputState.Cancel then
+		if aiming then
+			stopAim()
+		end
+	end
+	return Enum.ContextActionResult.Sink
+end
+
+ContextActionService:BindAction(ACTION, onAction, true, Config.Key, Config.GamepadKey)
+ContextActionService:SetTitle(ACTION, "Разлом")
+
+player.CharacterRemoving:Connect(function()
+	if aiming then
+		stopAim()
+	end
+end)
+
+-- Тряска камеры --------------------------------------------------------------
+
+local function shake(amount)
+	shakeAmount = math.max(shakeAmount, amount)
+end
+
+RunService:BindToRenderStep("CrystalRiftShake", Enum.RenderPriority.Camera.Value + 1, function(dt)
+	if shakeAmount <= 0.001 then
+		shakeAmount = 0
+		return
+	end
+	local a = math.rad(shakeAmount)
+	camera.CFrame = camera.CFrame
+		* CFrame.Angles((math.random() - 0.5) * a, (math.random() - 0.5) * a, (math.random() - 0.5) * a * 0.5)
+	shakeAmount = shakeAmount * math.exp(-dt * 8)
+end)
+
+-- События сервера ------------------------------------------------------------
+
+remote.OnClientEvent:Connect(function(event, value)
+	if event == "Cast" and typeof(value) == "number" then
+		cooldownTotal = value
+		cooldownEnd = os.clock() + value
+		pulsePanel(Config.CoreColor)
+		shake(1.5)
+	elseif event == "Cooldown" and typeof(value) == "number" then
+		cooldownEnd = os.clock() + value
+		pulsePanel(Color3.fromRGB(255, 90, 90))
+	elseif event == "Knock" and typeof(value) == "Vector3" then
+		local humanoid, root = getRoot()
+		if root then
+			humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+			root.AssemblyLinearVelocity = value
+			shake(4)
+		end
+	end
+end)
+
+RunService.RenderStepped:Connect(function()
+	local remaining = cooldownEnd - os.clock()
+	if remaining > 0 then
+		barFill.Size = UDim2.fromScale(1 - remaining / cooldownTotal, 1)
+		barFill.BackgroundColor3 = Color3.fromRGB(90, 110, 140)
+		status.Text = string.format("%.1f", remaining)
+	else
+		barFill.Size = UDim2.fromScale(1, 1)
+		barFill.BackgroundColor3 = Config.Color
+		status.Text = aiming and "Цель..." or "Готово"
+	end
+end)
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="LocalScript" referent="10">
+        <Properties>
+          <string name="Name">KatanaClient</string>
+          <string name="Source"><![CDATA[-- Клиент катаны: ввод, кнопки способностей, перезарядки, отброс и эффекты камеры.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local Lighting = game:GetService("Lighting")
+
+local Config = require(ReplicatedStorage:WaitForChild("KatanaConfig"))
+local remote = ReplicatedStorage:WaitForChild(Config.RemoteName)
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+local ABILITIES = {
+	{ id = "Slash", key = "ЛКМ", name = "Удар" },
+	{ id = "Wave", key = Config.Keys.Wave.Name, name = "Волна", action = "KatanaWave" },
+	{ id = "Dash", key = Config.Keys.Dash.Name, name = "Рывок", action = "KatanaDash" },
+	{ id = "Ultimate", key = Config.Keys.Ultimate.Name, name = "Буря клинков", action = "KatanaUltimate" },
+}
+
+local equippedTool = nil
+local activatedConnection = nil
+local readyAt = {}
+local durations = {}
+local shakeAmount = 0
+
+---------------------------------------------------------------------------
+-- UI
+---------------------------------------------------------------------------
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "KatanaUI"
+gui.ResetOnSpawn = false
+gui.Enabled = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local bar = Instance.new("Frame")
+bar.AnchorPoint = Vector2.new(0.5, 1)
+bar.Position = UDim2.new(0.5, 0, 1, -165)
+bar.Size = UDim2.fromOffset(4 * 80 + 3 * 8, 80)
+bar.BackgroundTransparency = 1
+bar.Parent = gui
+
+local layout = Instance.new("UIListLayout")
+layout.FillDirection = Enum.FillDirection.Horizontal
+layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+layout.Padding = UDim.new(0, 8)
+layout.Parent = bar
+
+local slots = {}
+
+for order, ability in ipairs(ABILITIES) do
+	local slot = Instance.new("Frame")
+	slot.LayoutOrder = order
+	slot.Size = UDim2.fromOffset(80, 80)
+	slot.BackgroundColor3 = Color3.fromRGB(20, 18, 26)
+	slot.BackgroundTransparency = 0.1
+	slot.ClipsDescendants = true
+	slot.Parent = bar
+	Instance.new("UICorner", slot).CornerRadius = UDim.new(0, 10)
+	local stroke = Instance.new("UIStroke", slot)
+	stroke.Color = Config.Color
+	stroke.Thickness = 2
+
+	local key = Instance.new("TextLabel")
+	key.BackgroundTransparency = 1
+	key.Position = UDim2.fromOffset(6, 4)
+	key.Size = UDim2.new(1, -12, 0, 18)
+	key.Font = Enum.Font.GothamBlack
+	key.TextSize = 16
+	key.TextXAlignment = Enum.TextXAlignment.Left
+	key.TextColor3 = Config.Color
+	key.Text = ability.key
+	key.ZIndex = 3
+	key.Parent = slot
+
+	local name = Instance.new("TextLabel")
+	name.BackgroundTransparency = 1
+	name.Position = UDim2.new(0, 4, 1, -30)
+	name.Size = UDim2.new(1, -8, 0, 26)
+	name.Font = Enum.Font.GothamBold
+	name.TextScaled = true
+	name.TextColor3 = Color3.new(1, 1, 1)
+	name.Text = ability.name
+	name.ZIndex = 3
+	name.Parent = slot
+
+	local overlay = Instance.new("Frame")
+	overlay.AnchorPoint = Vector2.new(0, 1)
+	overlay.Position = UDim2.fromScale(0, 1)
+	overlay.Size = UDim2.fromScale(1, 0)
+	overlay.BackgroundColor3 = Color3.new(0, 0, 0)
+	overlay.BackgroundTransparency = 0.35
+	overlay.BorderSizePixel = 0
+	overlay.ZIndex = 2
+	overlay.Parent = slot
+
+	local timer = Instance.new("TextLabel")
+	timer.BackgroundTransparency = 1
+	timer.Size = UDim2.fromScale(1, 1)
+	timer.Font = Enum.Font.GothamBlack
+	timer.TextSize = 24
+	timer.TextColor3 = Color3.new(1, 1, 1)
+	timer.TextStrokeTransparency = 0.3
+	timer.Text = ""
+	timer.ZIndex = 4
+	timer.Parent = slot
+
+	slots[ability.id] = { stroke = stroke, overlay = overlay, timer = timer }
+end
+
+local function flashSlot(id, color)
+	local slot = slots[id]
+	if slot then
+		slot.stroke.Color = color
+		TweenService:Create(slot.stroke, TweenInfo.new(0.4), { Color = Config.Color }):Play()
+	end
+end
+
+---------------------------------------------------------------------------
+-- Прицел и использование
+---------------------------------------------------------------------------
+
+local function getRoot()
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if humanoid and root and humanoid.Health > 0 then
+		return humanoid, root
+	end
+	return nil, nil
+end
+
+local function getAimPoint()
+	local ignore = { camera }
+	if player.Character then
+		table.insert(ignore, player.Character)
+	end
+	for _, name in ipairs({ Config.EffectsFolderName, "CrystalRiftEffects" }) do
+		local folder = workspace:FindFirstChild(name)
+		if folder then
+			table.insert(ignore, folder)
+		end
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+
+	local screenPoint
+	if UserInputService.TouchEnabled and not UserInputService.MouseEnabled then
+		screenPoint = camera.ViewportSize / 2
+	else
+		screenPoint = UserInputService:GetMouseLocation()
+	end
+	local ray = camera:ViewportPointToRay(screenPoint.X, screenPoint.Y)
+	local result = workspace:Raycast(ray.Origin, ray.Direction * 500, params)
+	return result and result.Position or (ray.Origin + ray.Direction * 500)
+end
+
+-- Разворачиваем персонажа к прицелу перед ударом (клиент владеет своим персонажем).
+local function faceAim(aim)
+	local _, root = getRoot()
+	if not root then
+		return
+	end
+	local dir = Vector3.new(aim.X - root.Position.X, 0, aim.Z - root.Position.Z)
+	if dir.Magnitude > 0.5 then
+		root.CFrame = CFrame.lookAt(root.Position, root.Position + dir)
+	end
+end
+
+local function useAbility(id)
+	if not equippedTool or not getRoot() then
+		return
+	end
+	if os.clock() < (readyAt[id] or 0) then
+		flashSlot(id, Color3.fromRGB(255, 80, 80))
+		return
+	end
+	local aim = getAimPoint()
+	faceAim(aim)
+	remote:FireServer(id, aim)
+end
+
+local actionToAbility = {}
+for _, ability in ipairs(ABILITIES) do
+	if ability.action then
+		actionToAbility[ability.action] = ability
+	end
+end
+
+local function onAction(actionName, state)
+	if state == Enum.UserInputState.Begin then
+		useAbility(actionToAbility[actionName].id)
+	end
+	return Enum.ContextActionResult.Sink
+end
+
+local function equip(tool)
+	equippedTool = tool
+	gui.Enabled = true
+	activatedConnection = tool.Activated:Connect(function()
+		useAbility("Slash")
+	end)
+	for _, ability in ipairs(ABILITIES) do
+		if ability.action then
+			ContextActionService:BindAction(ability.action, onAction, true, Config.Keys[ability.id])
+			ContextActionService:SetTitle(ability.action, ability.name)
+		end
+	end
+end
+
+local function unequip()
+	equippedTool = nil
+	gui.Enabled = false
+	if activatedConnection then
+		activatedConnection:Disconnect()
+		activatedConnection = nil
+	end
+	for _, ability in ipairs(ABILITIES) do
+		if ability.action then
+			ContextActionService:UnbindAction(ability.action)
+		end
+	end
+end
+
+local function onCharacter(character)
+	if equippedTool then
+		unequip()
+	end
+	character.ChildAdded:Connect(function(child)
+		if child:IsA("Tool") and child.Name == Config.ToolName then
+			equip(child)
+		end
+	end)
+	character.ChildRemoved:Connect(function(child)
+		if child == equippedTool then
+			unequip()
+		end
+	end)
+end
+
+player.CharacterAdded:Connect(onCharacter)
+if player.Character then
+	onCharacter(player.Character)
+end
+
+---------------------------------------------------------------------------
+-- Камера: тряска, FOV, цвет
+---------------------------------------------------------------------------
+
+local function shake(amount)
+	shakeAmount = math.max(shakeAmount, amount)
+end
+
+RunService:BindToRenderStep("KatanaShake", Enum.RenderPriority.Camera.Value + 1, function(dt)
+	if shakeAmount <= 0.001 then
+		shakeAmount = 0
+		return
+	end
+	local a = math.rad(shakeAmount)
+	camera.CFrame = camera.CFrame * CFrame.Angles((math.random() - 0.5) * a, (math.random() - 0.5) * a, (math.random() - 0.5) * a * 0.5)
+	shakeAmount = shakeAmount * math.exp(-dt * 9)
+end)
+
+local baseFov = camera.FieldOfView
+local function fovKick(amount, time)
+	camera.FieldOfView = baseFov + amount
+	TweenService:Create(camera, TweenInfo.new(time, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { FieldOfView = baseFov }):Play()
+end
+
+local tint = Instance.new("ColorCorrectionEffect")
+tint.Name = "KatanaUltimateTint"
+tint.Parent = Lighting
+
+---------------------------------------------------------------------------
+-- События сервера
+---------------------------------------------------------------------------
+
+remote.OnClientEvent:Connect(function(event, a, b)
+	if event == "Cooldown" and typeof(a) == "string" and typeof(b) == "number" then
+		readyAt[a] = os.clock() + b
+		durations[a] = b
+		flashSlot(a, Config.CoreColor)
+	elseif event == "Slash" then
+		shake(a == 3 and 1.6 or 0.6)
+	elseif event == "Wave" then
+		shake(1.2)
+		fovKick(6, 0.3)
+	elseif event == "Dash" then
+		shake(1.5)
+		fovKick(18, 0.45)
+	elseif event == "Ultimate" and typeof(a) == "number" then
+		fovKick(12, a)
+		tint.TintColor = Config.Color:Lerp(Color3.new(1, 1, 1), 0.6)
+		tint.Saturation = -0.4
+		tint.Contrast = 0.25
+		TweenService:Create(tint, TweenInfo.new(a + 0.4), { TintColor = Color3.new(1, 1, 1), Saturation = 0, Contrast = 0 }):Play()
+		task.spawn(function()
+			local stop = os.clock() + a
+			while os.clock() < stop do
+				shake(1)
+				task.wait(0.1)
+			end
+			shake(4)
+		end)
+	elseif event == "Knock" and typeof(a) == "Vector3" then
+		local humanoid, root = getRoot()
+		if root then
+			humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+			root.AssemblyLinearVelocity = a
+			shake(3)
+		end
+	end
+end)
+
+RunService.RenderStepped:Connect(function()
+	if not gui.Enabled then
+		return
+	end
+	local now = os.clock()
+	for id, slot in pairs(slots) do
+		local remaining = (readyAt[id] or 0) - now
+		if remaining > 0 and durations[id] then
+			slot.overlay.Size = UDim2.fromScale(1, remaining / durations[id])
+			slot.timer.Text = remaining >= 1 and string.format("%d", math.ceil(remaining)) or ""
+		else
+			slot.overlay.Size = UDim2.fromScale(1, 0)
+			slot.timer.Text = ""
+		end
+	end
+end)
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="Workspace" referent="11">
+    <Properties>
+      <string name="Name">Workspace</string>
+      <bool name="NeedsPivotMigration">false</bool>
+    </Properties>
+    <Item class="Part" referent="12">
+      <Properties>
+        <string name="Name">Baseplate</string>
+        <bool name="Anchored">true</bool>
+        <Color3uint8 name="Color3uint8">5868621</Color3uint8>
+        <bool name="Locked">true</bool>
+        <token name="Material">1280</token>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>-10</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>512</X>
+          <Y>20</Y>
+          <Z>512</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+    <Item class="SpawnLocation" referent="13">
+      <Properties>
+        <string name="Name">SpawnLocation</string>
+        <bool name="Anchored">true</bool>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>0.5</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>12</X>
+          <Y>1</Y>
+          <Z>12</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>
