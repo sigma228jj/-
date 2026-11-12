@@ -1,0 +1,27 @@
+{
+  "name": "CrystalRift",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "CrystalRiftConfig": {
+        "$path": "src/ReplicatedStorage/CrystalRiftConfig.lua"
+      }
+    },
+    "ServerScriptService": {
+      "$className": "ServerScriptService",
+      "CrystalRift": {
+        "$path": "src/ServerScriptService/CrystalRift.server.lua"
+      }
+    },
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": {
+        "$className": "StarterPlayerScripts",
+        "CrystalRiftClient": {
+          "$path": "src/StarterPlayer/StarterPlayerScripts/CrystalRiftClient.client.lua"
+        }
+      }
+    }
+  }
+}
